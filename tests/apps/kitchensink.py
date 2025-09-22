@@ -1,4 +1,5 @@
 import asyncio
+import sys
 from collections import defaultdict
 
 from asgiref.typing import ASGIReceiveCallable, ASGISendCallable, HTTPScope
@@ -341,6 +342,7 @@ async def _exception_after_response_complete(send: ASGISendCallable) -> None:
 async def _controlled(
     scope: HTTPScope, recv: ASGIReceiveCallable, send: ASGISendCallable
 ) -> None:
+    print("_controlled", file=sys.stderr)
     headers = scope["headers"]
     sleep_ms = 0
     response_bytes = 0
@@ -354,7 +356,9 @@ async def _controlled(
     body = b""
 
     while True:
+        print("Receiving message", file=sys.stderr)
         msg = await recv()
+        print(f"Received message: {msg}", file=sys.stderr)
         body += msg.get("body", b"")
         if not msg.get("more_body", False):
             break
@@ -378,12 +382,14 @@ async def _controlled(
         chunk = b"A" * response_bytes
         await send({"type": "http.response.body", "body": chunk, "more_body": False})
     else:
+        print("foo", file=sys.stderr)
         await send({"type": "http.response.body", "body": b"", "more_body": False})
 
 
 async def app(
     scope: HTTPScope, recv: ASGIReceiveCallable, send: ASGISendCallable
 ) -> None:
+    print("app")
     match scope["path"]:
         case "/headers-only":
             await _headers_only(scope, recv, send)

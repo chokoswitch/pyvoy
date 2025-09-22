@@ -23,7 +23,7 @@ def main() -> None:
             app_server.args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
         ) as server:
             for sleep in (0, 1, 10, 50, 100, 200, 500, 1000):
-                for response_size in (0, 1, 10, 100, 1000, 10000, 100000):
+                for response_size in (0, 100, 1000, 10000, 100000):
                     print(  # noqa: T201
                         f"Running benchmark for {app_server.name} with sleep={sleep}ms response_size={response_size}\n"
                     )
