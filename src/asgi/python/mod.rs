@@ -6,7 +6,7 @@ use std::{
 use crate::{
     asgi::python::{
         awaitable::{EmptyAwaitable, ErrorAwaitable, ValueAwaitable},
-        eventloop::EventLoops,
+        lifespan::{Lifespan, execute_lifespan},
     },
     envoy::SyncScheduler,
     eventbridge::EventBridge,
@@ -23,7 +23,6 @@ use std::sync::mpsc;
 use std::sync::mpsc::Sender;
 
 mod awaitable;
-mod eventloop;
 pub(crate) mod lifespan;
 
 create_exception!(pyvoy, ClientDisconnectedError, PyOSError);
@@ -39,20 +38,21 @@ struct ExecutorInner {
     app: Py<PyAny>,
     asgi: Py<PyDict>,
     extensions: Py<PyDict>,
-    loops: EventLoops,
+    state: Option<Py<PyDict>>,
+    loop_: Py<PyAny>,
     constants: Arc<Constants>,
     executor: Executor,
 }
 
 /// Holds [`JoinHandle`] for threads created by [`Executor`].
 pub(crate) struct ExecutorHandles {
-    loops: EventLoops,
+    loop_handle: JoinHandle<()>,
     gil_handle: JoinHandle<()>,
 }
 
 impl ExecutorHandles {
     pub(crate) fn join(self) {
-        self.loops.join();
+        let _ = self.loop_handle.join();
         let _ = self.gil_handle.join();
     }
 }
@@ -77,7 +77,7 @@ impl Executor {
         app_module: &str,
         app_attr: &str,
         constants: Arc<Constants>,
-    ) -> PyResult<(Self, ExecutorHandles)> {
+    ) -> PyResult<(Self, ExecutorHandles, Option<Lifespan>)> {
         // Import threading on this thread because Python records the first thread
         // that imports threading as the main thread. When running the Python interpreter, this
         // happens to work, but not when embedding. For our purposes, we just need the asyncio
@@ -88,7 +88,28 @@ impl Executor {
             Ok::<_, PyErr>(())
         })?;
 
-        let (app, asgi, extensions, loops) = Python::attach(|py| {
+        let (loop_tx, loop_rx) = mpsc::sync_channel(0);
+        let loop_handle = thread::spawn(move || {
+            let res: PyResult<()> = Python::attach(|py| {
+                let uvloop = py.import("uvloop")?;
+                let asyncio = py.import("asyncio")?;
+                let loop_ = uvloop.call_method0("new_event_loop")?;
+                loop_tx.send(loop_.clone().unbind()).unwrap();
+                asyncio.call_method1("set_event_loop", (&loop_,))?;
+                loop_.call_method0("run_forever")?;
+                Ok(())
+            });
+            res.unwrap();
+        });
+
+        let loop_ = loop_rx.recv().map_err(|e| {
+            PyRuntimeError::new_err(format!(
+                "Failed to initialize asyncio event loop for ASGI executor: {}",
+                e
+            ))
+        })?;
+
+        let (app, asgi, extensions, lifespan, state) = Python::attach(|py| {
             let module = py.import(app_module)?;
             let app = module.getattr(app_attr)?;
             let asgi = PyDict::new(py);
@@ -97,9 +118,15 @@ impl Executor {
             let extensions = PyDict::new(py);
             extensions.set_item("http.response.trailers", PyDict::new(py))?;
 
-            let loops = EventLoops::new(py, 1, &app, &asgi, &constants)?;
+            let (lifespan, state) = execute_lifespan(&app, &asgi, loop_.bind(py), &constants)?;
 
-            Ok::<_, PyErr>((app.unbind(), asgi.unbind(), extensions.unbind(), loops))
+            Ok::<_, PyErr>((
+                app.unbind(),
+                asgi.unbind(),
+                extensions.unbind(),
+                lifespan,
+                state,
+            ))
         })?;
 
         let (tx, rx) = mpsc::channel::<Event>();
@@ -109,7 +136,8 @@ impl Executor {
             app,
             asgi,
             extensions,
-            loops: loops.clone(),
+            state,
+            loop_,
             constants,
             executor: executor.clone(),
         };
@@ -149,7 +177,14 @@ impl Executor {
                 );
             }
         });
-        Ok((executor, ExecutorHandles { loops, gil_handle }))
+        Ok((
+            executor,
+            ExecutorHandles {
+                loop_handle,
+                gil_handle,
+            },
+            lifespan,
+        ))
     }
 
     pub(crate) fn execute_app(
@@ -185,7 +220,7 @@ impl Executor {
             .unwrap();
     }
 
-    pub(crate) fn handle_dropped_recv_future(&self, future: LoopFuture) {
+    pub(crate) fn handle_dropped_recv_future(&self, future: Py<PyAny>) {
         self.tx
             .send(Event::HandleDroppedRecvFuture(future))
             .unwrap();
@@ -195,7 +230,7 @@ impl Executor {
         self.tx.send(Event::HandleSendFuture(future)).unwrap();
     }
 
-    pub(crate) fn handle_dropped_send_future(&self, future: LoopFuture) {
+    pub(crate) fn handle_dropped_send_future(&self, future: Py<PyAny>) {
         self.tx
             .send(Event::HandleDroppedSendFuture(future))
             .unwrap();
@@ -232,15 +267,15 @@ impl ExecutorInner {
             Event::HandleRecvFuture {
                 body,
                 more_body,
-                future,
+                mut future,
             } => {
-                self.handle_recv_future(py, body, more_body, future)?;
+                self.handle_recv_future(py, body, more_body, future.future.take().unwrap())?;
             }
             Event::HandleDroppedRecvFuture(future) => {
                 self.handle_dropped_recv_future(py, future)?;
             }
-            Event::HandleSendFuture(future) => {
-                self.handle_send_future(py, future)?;
+            Event::HandleSendFuture(mut send_future) => {
+                self.handle_send_future(py, send_future.future.take().unwrap())?;
             }
             Event::HandleDroppedSendFuture(future) => {
                 self.handle_dropped_send_future(py, future)?;
@@ -264,8 +299,6 @@ impl ExecutorInner {
         send_bridge: EventBridge<SendEvent>,
         scheduler: SyncScheduler,
     ) -> PyResult<()> {
-        let (loop_, state) = self.loops.get(py);
-
         let scope_dict = PyDict::new(py);
         scope_dict.set_item(&self.constants.typ, &self.constants.http)?;
         scope_dict.set_item(&self.constants.asgi, &self.asgi)?;
@@ -287,7 +320,7 @@ impl ExecutorInner {
         }
         scope_dict.set_item(&self.constants.extensions, extensions)?;
 
-        if let Some(state) = &state {
+        if let Some(state) = &self.state {
             scope_dict.set_item(&self.constants.state, state)?;
         }
 
@@ -345,7 +378,7 @@ impl ExecutorInner {
             RecvCallable {
                 recv_bridge,
                 scheduler: scheduler.clone(),
-                loop_: loop_.clone().unbind(),
+                loop_: self.loop_.clone_ref(py),
                 executor: self.executor.clone(),
                 constants: self.constants.clone(),
             }
@@ -362,14 +395,16 @@ impl ExecutorInner {
                 closed: false,
                 send_bridge: send_bridge.clone(),
                 scheduler: scheduler.clone(),
-                loop_: loop_.clone().unbind(),
+                loop_: self.loop_.clone_ref(py),
                 executor: self.executor.clone(),
                 constants: self.constants.clone(),
             },
         ))?;
         let asyncio = py.import(&self.constants.asyncio)?;
-        let future =
-            asyncio.call_method1(&self.constants.run_coroutine_threadsafe, (coro, &loop_))?;
+        let future = asyncio.call_method1(
+            &self.constants.run_coroutine_threadsafe,
+            (coro, &self.loop_),
+        )?;
         future.call_method1(
             &self.constants.add_done_callback,
             (AppFutureHandler {
@@ -387,20 +422,14 @@ impl ExecutorInner {
         py: Python<'py>,
         body: Box<[u8]>,
         more_body: bool,
-        mut future: RecvFuture,
+        future: Py<PyAny>,
     ) -> PyResult<()> {
-        let f = match future.future.take() {
-            Some(f) => f,
-            None => {
-                return Ok(());
-            }
-        };
-        let set_result = f.future.getattr(py, &self.constants.set_result)?;
+        let set_result = future.getattr(py, &self.constants.set_result)?;
         let event = PyDict::new(py);
         event.set_item(&self.constants.typ, &self.constants.http_request)?;
         event.set_item(&self.constants.body, PyBytes::new(py, &body))?;
         event.set_item(&self.constants.more_body, more_body)?;
-        f.loop_.call_method1(
+        self.loop_.call_method1(
             py,
             &self.constants.call_soon_threadsafe,
             (set_result, event),
@@ -408,11 +437,11 @@ impl ExecutorInner {
         Ok(())
     }
 
-    fn handle_dropped_recv_future<'py>(&self, py: Python<'py>, future: LoopFuture) -> PyResult<()> {
-        let set_result = future.future.getattr(py, &self.constants.set_result)?;
+    fn handle_dropped_recv_future<'py>(&self, py: Python<'py>, future: Py<PyAny>) -> PyResult<()> {
+        let set_result = future.getattr(py, &self.constants.set_result)?;
         let event = PyDict::new(py);
         event.set_item(&self.constants.typ, &self.constants.http_disconnect)?;
-        future.loop_.call_method1(
+        self.loop_.call_method1(
             py,
             &self.constants.call_soon_threadsafe,
             (set_result, event),
@@ -420,15 +449,9 @@ impl ExecutorInner {
         Ok(())
     }
 
-    fn handle_send_future<'py>(&self, py: Python<'py>, mut future: SendFuture) -> PyResult<()> {
-        let f = match future.future.take() {
-            Some(f) => f,
-            None => {
-                return Ok(());
-            }
-        };
-        let set_result = f.future.getattr(py, &self.constants.set_result)?;
-        f.loop_.call_method1(
+    fn handle_send_future<'py>(&self, py: Python<'py>, future: Py<PyAny>) -> PyResult<()> {
+        let set_result = future.getattr(py, &self.constants.set_result)?;
+        self.loop_.call_method1(
             py,
             &self.constants.call_soon_threadsafe,
             (set_result, PyNone::get(py)),
@@ -436,9 +459,9 @@ impl ExecutorInner {
         Ok(())
     }
 
-    fn handle_dropped_send_future<'py>(&self, py: Python<'py>, future: LoopFuture) -> PyResult<()> {
-        let set_exception = future.future.getattr(py, &self.constants.set_exception)?;
-        future.loop_.call_method1(
+    fn handle_dropped_send_future<'py>(&self, py: Python<'py>, future: Py<PyAny>) -> PyResult<()> {
+        let set_exception = future.getattr(py, &self.constants.set_exception)?;
+        self.loop_.call_method1(
             py,
             &self.constants.call_soon_threadsafe,
             (set_exception, ClientDisconnectedError::new_err(())),
@@ -447,7 +470,9 @@ impl ExecutorInner {
     }
 
     fn shutdown<'py>(&self, py: Python<'py>) -> PyResult<()> {
-        self.loops.stop(py)?;
+        let stop = self.loop_.getattr(py, &self.constants.stop)?;
+        self.loop_
+            .call_method1(py, &self.constants.call_soon_threadsafe, (stop,))?;
         Ok(())
     }
 }
@@ -467,9 +492,9 @@ enum Event {
         more_body: bool,
         future: RecvFuture,
     },
-    HandleDroppedRecvFuture(LoopFuture),
+    HandleDroppedRecvFuture(Py<PyAny>),
     HandleSendFuture(SendFuture),
-    HandleDroppedSendFuture(LoopFuture),
+    HandleDroppedSendFuture(Py<PyAny>),
     Shutdown,
 }
 
@@ -492,10 +517,7 @@ impl RecvCallable {
             .bind(py)
             .call_method0(&self.constants.create_future)?;
         let recv_future = RecvFuture {
-            future: Some(LoopFuture {
-                future: future.clone().unbind(),
-                loop_: self.loop_.clone_ref(py),
-            }),
+            future: Some(future.clone().unbind()),
             executor: self.executor.clone(),
         };
         if self.recv_bridge.send(recv_future).is_ok() {
@@ -661,10 +683,7 @@ impl SendCallable {
                     (
                         future.clone(),
                         Some(SendFuture {
-                            future: Some(LoopFuture {
-                                future: future.unbind(),
-                                loop_: self.loop_.clone_ref(py),
-                            }),
+                            future: Some(future.unbind()),
                             executor: self.executor.clone(),
                         }),
                     )
@@ -795,7 +814,7 @@ pub(crate) enum SendEvent {
 }
 
 pub(crate) struct RecvFuture {
-    future: Option<LoopFuture>,
+    future: Option<Py<PyAny>>,
     executor: Executor,
 }
 
@@ -807,13 +826,8 @@ impl Drop for RecvFuture {
     }
 }
 
-pub(crate) struct LoopFuture {
-    future: Py<PyAny>,
-    loop_: Py<PyAny>,
-}
-
 pub(crate) struct SendFuture {
-    future: Option<LoopFuture>,
+    future: Option<Py<PyAny>>,
     executor: Executor,
 }
 
