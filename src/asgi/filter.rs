@@ -141,12 +141,19 @@ impl<EHF: EnvoyHttpFilter> HttpFilter<EHF> for Filter {
     }
 
     fn on_scheduled(&mut self, envoy_filter: &mut EHF, event_id: u64) {
-        if event_id == EVENT_ID_REQUEST {
-            self.handle_read(envoy_filter);
-            return;
-        }
-        if self.downstream_watermark_level == 0 {
-            self.process_send_events(envoy_filter);
+        match event_id {
+            EVENT_ID_REQUEST => {
+                self.handle_read(envoy_filter);
+                return;
+            }
+            EVENT_ID_RESPONSE => {
+                self.process_send_events(envoy_filter);
+                return;
+            }
+            EVENT_ID_OUTGOING_REQUEST => {
+                return;
+            }
+            _ => unreachable!(),
         }
     }
 

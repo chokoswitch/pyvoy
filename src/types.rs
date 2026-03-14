@@ -149,6 +149,8 @@ pub(crate) struct Constants {
     // asyncio methods
     /// The string "asyncio".
     pub asyncio: Py<PyString>,
+    /// The string "cancel".
+    pub cancel: Py<PyString>,
     /// The string "run_coroutine_threadsafe".
     pub run_coroutine_threadsafe: Py<PyString>,
     /// The string "create_task".
@@ -228,6 +230,9 @@ pub(crate) struct Constants {
 
     /// The root path value passed from configuration.
     pub root_path_value: Py<PyString>,
+
+    /// The string "items".
+    pub items: Py<PyString>,
 
     /// A singleton ClientDisconnectedError exception instance.
     /// The traceback is not important since it is caused by the client,
@@ -318,6 +323,7 @@ impl Constants {
             websocket_receive: PyString::new(py, "websocket.receive").unbind(),
 
             asyncio: PyString::new(py, "asyncio").unbind(),
+            cancel: PyString::new(py, "cancel").unbind(),
             run_coroutine_threadsafe: PyString::new(py, "run_coroutine_threadsafe").unbind(),
             create_task: PyString::new(py, "create_task").unbind(),
             add_done_callback: PyString::new(py, "add_done_callback").unbind(),
@@ -363,6 +369,9 @@ impl Constants {
             empty_string: PyString::new(py, "").unbind(),
 
             root_path_value: PyString::new(py, root_path).unbind(),
+
+            // pyqwest
+            items: PyString::new(py, "items").unbind(),
 
             client_disconnected_err,
         }

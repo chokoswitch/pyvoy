@@ -171,6 +171,10 @@ impl Executor {
             .unwrap();
     }
 
+    pub(crate) fn handle_canceled_future(&self, future: LoopFuture) {
+        self.tx.send(Event::HandleCanceledFuture(future)).unwrap();
+    }
+
     pub(crate) fn shutdown(&self) {
         self.tx.send(Event::Shutdown).unwrap();
     }
@@ -223,13 +227,16 @@ impl ExecutorInner {
                     (dropped_recv_future_executor,),
                 )?;
             }
-            // No real logic in handling send futures so we don't bother with
+            // No real logic in handling send or canceled futures so we don't bother with
             // running on the event loop.
             Event::HandleSendFuture(future) => {
                 self.handle_send_future(py, future)?;
             }
             Event::HandleDroppedSendFuture(future) => {
                 self.handle_dropped_send_future(py, future)?;
+            }
+            Event::HandleCanceledFuture(future) => {
+                self.handle_canceled_future(py, future)?;
             }
             Event::Shutdown => {
                 self.shutdown(py)?;
@@ -262,6 +269,14 @@ impl ExecutorInner {
             &self.constants.call_soon_threadsafe,
             (set_exception, &self.constants.client_disconnected_err),
         )?;
+        Ok(())
+    }
+
+    fn handle_canceled_future<'py>(&self, py: Python<'py>, future: LoopFuture) -> PyResult<()> {
+        let cancel = future.future.getattr(py, &self.constants.cancel)?;
+        future
+            .loop_
+            .call_method1(py, &self.constants.call_soon_threadsafe, (cancel,))?;
         Ok(())
     }
 
@@ -416,6 +431,7 @@ enum Event {
     HandleDroppedRecvFuture(LoopFuture),
     HandleSendFuture(SendFuture),
     HandleDroppedSendFuture(LoopFuture),
+    HandleCanceledFuture(LoopFuture),
     Shutdown,
 }
 
@@ -767,3 +783,5 @@ impl Drop for SendFuture {
 pub(crate) const EVENT_ID_REQUEST: u64 = 1;
 /// The event ID to trigger the filter to process response events.
 pub(crate) const EVENT_ID_RESPONSE: u64 = 2;
+/// The event ID to trigger an outgoing HTTP request.
+pub(crate) const EVENT_ID_OUTGOING_REQUEST: u64 = 3;
