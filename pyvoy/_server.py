@@ -5,6 +5,7 @@ import base64
 import contextlib
 import json
 import os
+import ssl
 import subprocess
 import sys
 import urllib.request
@@ -574,11 +575,54 @@ class PyvoyServer:
                 }
             )
 
+        clusters: list[dict] = [
+            {
+                "name": "__pyvoy_default_upstream_http__",
+                "lb_policy": "CLUSTER_PROVIDED",
+                "cluster_type": {
+                    "name": "envoy.clusters.dynamic_forward_proxy",
+                    "typed_config": {
+                        "@type": "type.googleapis.com/envoy.extensions.clusters.dynamic_forward_proxy.v3.ClusterConfig",
+                        "sub_clusters_config": {"lb_policy": "ROUND_ROBIN"},
+                    },
+                },
+            },
+            {
+                "name": "__pyvoy_default_upstream_https__",
+                "lb_policy": "CLUSTER_PROVIDED",
+                "cluster_type": {
+                    "name": "envoy.clusters.dynamic_forward_proxy",
+                    "typed_config": {
+                        "@type": "type.googleapis.com/envoy.extensions.clusters.dynamic_forward_proxy.v3.ClusterConfig",
+                        "sub_clusters_config": {"lb_policy": "ROUND_ROBIN"},
+                    },
+                },
+            },
+        ]
+
+        ca_file = ssl.get_default_verify_paths().cafile
+        if ca_file is None:
+            msg = "Could not find a default system CA certificates file."
+            raise StartupError(msg)
+
+        clusters[1]["transport_socket"] = {
+            "name": "envoy.transport_sockets.tls",
+            "typed_config": {
+                "@type": "type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext",
+                "auto_host_sni": True,
+                "auto_sni_san_validation": True,
+                "common_tls_context": {
+                    "alpn_protocols": ["h2", "http/1.1"],
+                    "validation_context": {"trusted_ca": {"filename": ca_file}},
+                },
+            },
+        }
+
         return {
             "admin": {
                 "address": {"socket_address": {"address": "127.0.0.1", "port_value": 0}}
             },
-            "static_resources": {"listeners": listeners},
+            "static_resources": {"listeners": listeners, "clusters": clusters},
         }
 
 

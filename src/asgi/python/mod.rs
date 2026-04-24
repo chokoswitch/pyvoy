@@ -4,14 +4,17 @@ use std::{
 };
 
 use crate::{
-    asgi::shared::{
-        ExecutorHandles,
-        app::load_app,
-        awaitable::{EmptyAwaitable, ErrorAwaitable, ValueAwaitable},
-        eventloop::EventLoops,
-        get_gil_batch_size,
-        headers::extract_headers_from_event,
-        scope::new_scope_dict,
+    asgi::{
+        shared::{
+            ExecutorHandles,
+            app::load_app,
+            awaitable::{EmptyAwaitable, ErrorAwaitable, ValueAwaitable},
+            eventloop::EventLoops,
+            get_gil_batch_size,
+            headers::extract_headers_from_event,
+            scope::new_scope_dict,
+        },
+        transport::{ResponseContent, StreamStartExecutor},
     },
     eventbridge::EventBridge,
     types::{ClientDisconnectedError, Constants, Scope, SyncReceiver},
@@ -49,6 +52,7 @@ struct ExecutorInner {
 #[derive(Clone)]
 pub(crate) struct Executor {
     tx: Sender<Event>,
+    constants: Arc<Constants>,
 }
 
 impl Executor {
@@ -74,7 +78,10 @@ impl Executor {
         })?;
 
         let (tx, rx) = mpsc::channel::<Event>();
-        let executor = Self { tx };
+        let executor = Self {
+            tx,
+            constants: constants.clone(),
+        };
 
         let inner = ExecutorInner {
             app,
@@ -171,6 +178,31 @@ impl Executor {
             .unwrap();
     }
 
+    pub(crate) fn handle_transport_stream_started(
+        &self,
+        request_headers: Vec<(HeaderName, HeaderValue)>,
+        response_content: ResponseContent,
+        response_future: Py<PyAny>,
+        end_stream: bool,
+    ) {
+        let stream_start_executor = StreamStartExecutor::new(
+            request_headers,
+            response_future,
+            response_content,
+            end_stream,
+            self.constants.clone(),
+        );
+        self.tx
+            .send(Event::HandleStreamStart(stream_start_executor))
+            .unwrap();
+    }
+
+    pub(crate) fn notify_response(&self, response_content: ResponseContent) {
+        self.tx
+            .send(Event::NotifyResponse(response_content))
+            .unwrap();
+    }
+
     pub(crate) fn handle_canceled_future(&self, future: LoopFuture) {
         self.tx.send(Event::HandleCanceledFuture(future)).unwrap();
     }
@@ -237,6 +269,25 @@ impl ExecutorInner {
             }
             Event::HandleCanceledFuture(future) => {
                 self.handle_canceled_future(py, future)?;
+            }
+            Event::HandleStreamStart(stream_start_executor) => {
+                let loop_ = stream_start_executor
+                    .response_content
+                    .inner
+                    .loop_
+                    .bind(py)
+                    .clone();
+                loop_.call_method1(
+                    &self.constants.call_soon_threadsafe,
+                    (stream_start_executor.into_py_any(py)?,),
+                )?;
+            }
+            Event::NotifyResponse(content) => {
+                let loop_ = content.inner.loop_.bind(py).clone();
+                loop_.call_method1(
+                    &self.constants.call_soon_threadsafe,
+                    (content.into_py_any(py)?,),
+                )?;
             }
             Event::Shutdown => {
                 self.shutdown(py)?;
@@ -431,6 +482,8 @@ enum Event {
     HandleDroppedRecvFuture(LoopFuture),
     HandleSendFuture(SendFuture),
     HandleDroppedSendFuture(LoopFuture),
+    HandleStreamStart(StreamStartExecutor),
+    NotifyResponse(ResponseContent),
     HandleCanceledFuture(LoopFuture),
     Shutdown,
 }
@@ -487,7 +540,7 @@ impl EmptyRecvCallable {
         } else {
             self.constants.asgi_empty_recv.bind(py).copy()?
         };
-        ValueAwaitable::new_py(py, event.into_any().unbind())
+        ValueAwaitable::new_py(py, &event.into_any())
     }
 }
 
@@ -761,8 +814,8 @@ impl Drop for RecvFuture {
 
 /// A Python future with its associated event loop for easy access from Rust.
 pub(crate) struct LoopFuture {
-    future: Py<PyAny>,
-    loop_: Py<PyAny>,
+    pub(crate) future: Py<PyAny>,
+    pub(crate) loop_: Py<PyAny>,
 }
 
 /// A Python future to notify when a send completes.

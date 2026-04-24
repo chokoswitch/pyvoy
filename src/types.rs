@@ -231,8 +231,16 @@ pub(crate) struct Constants {
     /// The root path value passed from configuration.
     pub root_path_value: Py<PyString>,
 
+    /// The string "add".
+    pub add: Py<PyString>,
     /// The string "items".
     pub items: Py<PyString>,
+    /// The string "url".
+    pub url: Py<PyString>,
+    /// The class pyqwest.Headers.
+    pub class_pyqwest_headers: Py<PyAny>,
+    /// The class pyqwest.Response.
+    pub class_pyqwest_response: Py<PyAny>,
 
     /// A singleton ClientDisconnectedError exception instance.
     /// The traceback is not important since it is caused by the client,
@@ -260,6 +268,8 @@ impl Constants {
         asgi_empty_recv_disconnect
             .set_item("type", "http.disconnect")
             .unwrap();
+
+        let mod_pyqwest = py.import("pyqwest").unwrap();
 
         Self {
             asgi: PyString::new(py, "asgi").unbind(),
@@ -371,7 +381,11 @@ impl Constants {
             root_path_value: PyString::new(py, root_path).unbind(),
 
             // pyqwest
+            add: PyString::new(py, "add").unbind(),
             items: PyString::new(py, "items").unbind(),
+            url: PyString::new(py, "url").unbind(),
+            class_pyqwest_headers: mod_pyqwest.getattr("Headers").unwrap().unbind(),
+            class_pyqwest_response: mod_pyqwest.getattr("Response").unwrap().unbind(),
 
             client_disconnected_err,
         }

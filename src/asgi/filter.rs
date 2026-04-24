@@ -2,12 +2,14 @@ use envoy_proxy_dynamic_modules_rust_sdk::*;
 use http::{HeaderName, HeaderValue};
 use pyo3::Python;
 use pyo3::types::PyTracebackMethods as _;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::asgi::python;
 use crate::asgi::python::*;
 use crate::asgi::shared::ExecutorHandles;
+use crate::asgi::transport::{RequestBody, ResponseState, TransportEvent};
 use crate::envoy::*;
 use crate::eventbridge::EventBridge;
 use crate::types::*;
@@ -62,6 +64,8 @@ impl<EHF: EnvoyHttpFilter> HttpFilterConfig<EHF> for Config {
             response_trailers: None,
             recv_bridge: EventBridge::new(),
             send_bridge: EventBridge::new(),
+            transport_bridge: EventBridge::new(),
+            transport_responses: HashMap::new(),
             downstream_watermark_level: 0,
         })
     }
@@ -77,6 +81,9 @@ struct Filter {
 
     recv_bridge: EventBridge<RecvFuture>,
     send_bridge: EventBridge<SendEvent>,
+
+    transport_bridge: EventBridge<TransportEvent>,
+    transport_responses: HashMap<u64, ResponseState>,
 
     downstream_watermark_level: usize,
 }
@@ -144,14 +151,12 @@ impl<EHF: EnvoyHttpFilter> HttpFilter<EHF> for Filter {
         match event_id {
             EVENT_ID_REQUEST => {
                 self.handle_read(envoy_filter);
-                return;
             }
             EVENT_ID_RESPONSE => {
                 self.process_send_events(envoy_filter);
-                return;
             }
             EVENT_ID_OUTGOING_REQUEST => {
-                return;
+                self.process_transport_events(envoy_filter);
             }
             _ => unreachable!(),
         }
@@ -166,6 +171,83 @@ impl<EHF: EnvoyHttpFilter> HttpFilter<EHF> for Filter {
         if self.downstream_watermark_level == 0 {
             envoy_filter.new_scheduler().commit(EVENT_ID_RESPONSE);
         }
+    }
+
+    fn on_http_stream_headers(
+        &mut self,
+        _envoy_filter: &mut EHF,
+        stream_handle: u64,
+        response_headers: &[(EnvoyBuffer, EnvoyBuffer)],
+        end_stream: bool,
+    ) {
+        let Some(state) = self.transport_responses.get_mut(&stream_handle) else {
+            // Can't happen in practice but avoid panic anyways.
+            return;
+        };
+        let Some(future) = state.future.take() else {
+            // Shouldn't happen in practice.
+            return;
+        };
+
+        let mut headers: Vec<(HeaderName, HeaderValue)> =
+            Vec::with_capacity(response_headers.len());
+        for (k, v) in response_headers {
+            match (
+                HeaderName::from_bytes(k.as_slice()),
+                HeaderValue::from_bytes(v.as_slice()),
+            ) {
+                (Ok(name), Ok(value)) => headers.push((name, value)),
+                // Should be validated by Envoy already so shouldn't happen in practice.
+                _ => continue,
+            }
+        }
+        self.executor.handle_transport_stream_started(
+            headers,
+            state.content.clone(),
+            future,
+            end_stream,
+        );
+    }
+
+    fn on_http_stream_data(
+        &mut self,
+        _envoy_filter: &mut EHF,
+        stream_handle: u64,
+        response_data: &[EnvoyBuffer],
+        end_stream: bool,
+    ) {
+        let Some(state) = self.transport_responses.get_mut(&stream_handle) else {
+            return;
+        };
+        if state.content.feed_response_data(response_data, end_stream) {
+            self.executor.notify_response(state.content.clone());
+        }
+    }
+
+    fn on_http_stream_trailers(
+        &mut self,
+        _envoy_filter: &mut EHF,
+        stream_handle: u64,
+        response_trailers: &[(EnvoyBuffer, EnvoyBuffer)],
+    ) {
+        let Some(state) = self.transport_responses.get_mut(&stream_handle) else {
+            return;
+        };
+        if state.content.feed_response_trailers(response_trailers) {
+            self.executor.notify_response(state.content.clone());
+        }
+    }
+
+    fn on_http_stream_reset(
+        &mut self,
+        _envoy_filter: &mut EHF,
+        _stream_handle: u64,
+        _reset_reason: abi::envoy_dynamic_module_type_http_stream_reset_reason,
+    ) {
+    }
+
+    fn on_http_stream_complete(&mut self, _envoy_filter: &mut EHF, stream_handle: u64) {
+        self.transport_responses.remove(&stream_handle);
     }
 }
 
@@ -243,6 +325,43 @@ impl Filter {
                         Some(b"Internal Server Error"),
                         None,
                     );
+                }
+            }
+        });
+    }
+
+    fn process_transport_events(&mut self, envoy_filter: &mut impl EnvoyHttpFilter) {
+        self.transport_bridge.process(|event| match event {
+            TransportEvent::Start(event) => {
+                let mut headers: Vec<(&str, &[u8])> = Vec::with_capacity(event.headers.len() + 1);
+                for (k, v) in event.headers.iter() {
+                    headers.push((k.as_str(), v.as_bytes()));
+                }
+                match event.body {
+                    RequestBody::Empty | RequestBody::Buffered(_) => {
+                        todo!()
+                    }
+                    RequestBody::Iter(_) => {
+                        let cluster_name = if let Some(name) = event.cluster_name.as_ref() {
+                            name.as_str()
+                        } else {
+                            "__pyvoy_default_upstream__"
+                        };
+                        let (_res, stream_id) = envoy_filter.start_http_stream(
+                            cluster_name,
+                            headers,
+                            None,
+                            true,
+                            60_000,
+                        );
+                        self.transport_responses.insert(
+                            stream_id,
+                            ResponseState {
+                                future: Some(event.response_future),
+                                content: event.response_content,
+                            },
+                        );
+                    }
                 }
             }
         });
