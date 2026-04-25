@@ -153,7 +153,9 @@ impl<EHF: EnvoyHttpFilter> HttpFilter<EHF> for Filter {
                 self.handle_read(envoy_filter);
             }
             EVENT_ID_RESPONSE => {
-                self.process_send_events(envoy_filter);
+                if self.downstream_watermark_level == 0 {
+                    self.process_send_events(envoy_filter);
+                }
             }
             EVENT_ID_OUTGOING_REQUEST => {
                 self.process_transport_events(envoy_filter);
