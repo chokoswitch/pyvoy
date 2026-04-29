@@ -51,8 +51,6 @@ pub(super) struct StartStreamEvent {
     pub response_content: ResponseContent,
 }
 
-pub(super) struct ReadResponseBodyEvent {}
-
 pub(super) enum TransportEvent {
     Start(StartStreamEvent),
 }
