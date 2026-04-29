@@ -1,4 +1,3 @@
-use std::sync::Arc;
 use std::sync::mpsc::Receiver;
 
 use crate::envoy::*;
@@ -9,7 +8,6 @@ use http::{
     HeaderName, HeaderValue, Method,
     uri::{self, Scheme},
 };
-use pyo3::sync::PyOnceLock;
 use pyo3::{
     IntoPyObjectExt, create_exception,
     exceptions::PyOSError,
@@ -258,12 +256,9 @@ pub(crate) struct Constants {
 }
 
 impl Constants {
-    pub fn get(py: Python<'_>, root_path: &str) -> Arc<Self> {
-        static INSTANCE: PyOnceLock<Arc<Constants>> = PyOnceLock::new();
+    pub fn new(py: Python<'_>, root_path: &str) -> Self {
         // It is a programming bug for this to fail so we just unwrap.
-        INSTANCE
-            .get_or_init(py, || Arc::new(Self::create(py, root_path).unwrap()))
-            .clone()
+        Self::create(py, root_path).unwrap()
     }
 
     fn create(py: Python<'_>, root_path: &str) -> PyResult<Self> {

@@ -100,7 +100,7 @@ fn new_http_filter_config_fn<EC: EnvoyHttpFilterConfig, EHF: EnvoyHttpFilter>(
     };
     let enable_lifespan = filter_config["lifespan"].as_bool();
 
-    let constants = Python::attach(|py| types::Constants::get(py, root_path));
+    let constants = Arc::new(Python::attach(|py| types::Constants::new(py, root_path)));
 
     match interface {
         "asgi" => asgi::filter::Config::new(app, constants, worker_threads, enable_lifespan)
@@ -136,11 +136,10 @@ fn new_network_filter_config_fn<EC: EnvoyNetworkFilterConfig, EHF: EnvoyNetworkF
         envoy_log_error!("Filter config missing required 'app' field");
         return None;
     };
-    let root_path = filter_config["root_path"].as_str().unwrap_or("");
     let worker_threads = filter_config["worker_threads"].as_i64().unwrap_or(1) as usize;
     let enable_lifespan = filter_config["lifespan"].as_bool();
 
-    let constants = Python::attach(|py| types::Constants::get(py, root_path));
+    let constants = Arc::new(Python::attach(|py| types::Constants::new(py, "")));
     asgi::websocket::Config::new(app, constants, worker_threads, enable_lifespan)
         .map(|cfg| Box::new(cfg) as Box<dyn NetworkFilterConfig<EHF>>)
 }

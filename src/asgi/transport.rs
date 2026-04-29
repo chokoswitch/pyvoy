@@ -89,7 +89,7 @@ impl HTTPTransport {
     fn py_new(py: Python<'_>, cluster_name: Option<String>) -> Self {
         Self {
             cluster_name: cluster_name.map(Arc::new),
-            constants: Constants::get(py, ""),
+            constants: Arc::new(Constants::new(py, "")),
         }
     }
 
