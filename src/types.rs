@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use std::sync::mpsc::Receiver;
 
 use crate::envoy::*;
@@ -8,6 +9,7 @@ use http::{
     HeaderName, HeaderValue, Method,
     uri::{self, Scheme},
 };
+use pyo3::sync::PyOnceLock;
 use pyo3::{
     IntoPyObjectExt, create_exception,
     exceptions::PyOSError,
@@ -228,11 +230,11 @@ pub(crate) struct Constants {
     /// An empty string object.
     pub empty_string: Py<PyString>,
 
-    /// The root path value passed from configuration.
-    pub root_path_value: Py<PyString>,
-
+    // Pyqwest
     /// The string "add".
     pub add: Py<PyString>,
+    /// The string "content".
+    pub content: Py<PyString>,
     /// The string "items".
     pub items: Py<PyString>,
     /// The string "url".
@@ -256,12 +258,15 @@ pub(crate) struct Constants {
 }
 
 impl Constants {
-    pub fn new(py: Python<'_>, root_path: &str) -> Self {
-        // It is a programming bug for this to fail so we just unwrap.
-        Self::create(py, root_path).unwrap()
+    pub fn get(py: Python<'_>) -> Arc<Self> {
+        static INSTANCE: PyOnceLock<Arc<Constants>> = PyOnceLock::new();
+        INSTANCE
+            // It is a programming bug for this to fail so we just unwrap.
+            .get_or_init(py, || Arc::new(Self::create(py).unwrap()))
+            .clone()
     }
 
-    fn create(py: Python<'_>, root_path: &str) -> PyResult<Self> {
+    fn create(py: Python<'_>) -> PyResult<Self> {
         let client_disconnected_err = ClientDisconnectedError::new_err(()).into_py_any(py)?;
         client_disconnected_err.setattr(py, "__traceback__", PyNone::get(py))?;
 
@@ -387,10 +392,9 @@ impl Constants {
             empty_bytes: PyBytes::new(py, b"").unbind(),
             empty_string: PyString::new(py, "").unbind(),
 
-            root_path_value: PyString::new(py, root_path).unbind(),
-
             // pyqwest
             add: PyString::new(py, "add").unbind(),
+            content: PyString::new(py, "content").unbind(),
             items: PyString::new(py, "items").unbind(),
             url: PyString::new(py, "url").unbind(),
             class_pyqwest_headers: mod_pyqwest.getattr("Headers")?.unbind(),

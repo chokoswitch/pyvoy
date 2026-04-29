@@ -8,12 +8,16 @@ use envoy_proxy_dynamic_modules_rust_sdk::{EnvoyBuffer, EnvoyHttpFilterScheduler
 use http::{HeaderName, HeaderValue, StatusCode};
 use pyo3::{
     Bound, IntoPyObjectExt, Py, PyAny, PyResult, Python,
-    exceptions::{PyRuntimeError, PyStopAsyncIteration},
+    exceptions::{PyRuntimeError, PyStopAsyncIteration, PyValueError},
     pybacked::PyBackedBytes,
     pyclass, pymethods,
     sync::MutexExt,
-    types::{PyAnyMethods as _, PyBytes, PyDict, PyString, PyStringMethods},
+    types::{
+        PyAnyMethods as _, PyBytes, PyDict, PyModule, PyModuleMethods as _, PyString,
+        PyStringMethods,
+    },
 };
+use url::Url;
 
 use crate::{
     asgi::{
@@ -44,6 +48,8 @@ pub(super) enum RequestBody {
 }
 
 pub(super) struct StartStreamEvent {
+    pub method: http::Method,
+    pub url: Url,
     pub headers: Vec<(HeaderName, HeaderValue)>,
     pub body: RequestBody,
     pub cluster_name: Option<Arc<String>>,
@@ -51,11 +57,27 @@ pub(super) struct StartStreamEvent {
     pub response_content: ResponseContent,
 }
 
-pub(super) enum TransportEvent {
-    Start(StartStreamEvent),
+pub(super) struct OnHttpStreamheadersEvent {
+    pub stream_handle: u64,
+    pub headers: Vec<(HeaderName, HeaderValue)>,
+    pub end_stream: bool,
 }
 
-#[pyclass(module = "_pyvoy.async.httpclient", frozen)]
+pub(super) struct OnHttpStreamDataEvent {
+    pub stream_handle: u64,
+    pub data: Vec<u8>,
+    pub end_stream: bool,
+}
+
+pub(super) enum TransportEvent {
+    Start(StartStreamEvent),
+    // We need to schedule transport events within the Envoy filter itself since
+    // on_http_stream callbacks seem to be invoked from arbitrary threads.
+    OnHttpStreamHeaders(OnHttpStreamheadersEvent),
+    OnHttpStreamData(OnHttpStreamDataEvent),
+}
+
+#[pyclass(module = "_pyvoy.asgi.httpclient", frozen)]
 pub(crate) struct TransportBridge {
     loop_: Py<PyAny>,
     bridge: EventBridge<TransportEvent>,
@@ -76,7 +98,23 @@ impl TransportBridge {
     }
 }
 
-#[pyclass(module = "_pyvoy.async.httpclient")]
+pub(crate) fn register_py_module(py: Python<'_>) -> PyResult<()> {
+    let asgi = PyModule::new(py, "pyvoy.asgi")?;
+    let httpclient = PyModule::new(py, "pyvoy.asgi.httpclient")?;
+    httpclient.add_class::<HTTPTransport>()?;
+    asgi.setattr("httpclient", &httpclient)?;
+
+    let sys_modules = py
+        .import("sys")?
+        .getattr("modules")?
+        .cast_into::<PyDict>()?;
+    sys_modules.set_item("pyvoy.asgi", asgi)?;
+    sys_modules.set_item("pyvoy.asgi.httpclient", httpclient)?;
+
+    Ok(())
+}
+
+#[pyclass(module = "pyvoy.asgi.httpclient")]
 struct HTTPTransport {
     cluster_name: Option<Arc<String>>,
     constants: Arc<Constants>,
@@ -89,7 +127,7 @@ impl HTTPTransport {
     fn py_new(py: Python<'_>, cluster_name: Option<String>) -> Self {
         Self {
             cluster_name: cluster_name.map(Arc::new),
-            constants: Arc::new(Constants::new(py, "")),
+            constants: Constants::get(py),
         }
     }
 
@@ -114,31 +152,23 @@ impl HTTPTransport {
 
         let req_headers = request.getattr(&self.constants.headers)?;
 
-        let mut headers: Vec<(HeaderName, HeaderValue)> =
-            Vec::with_capacity(req_headers.len()? + 3);
-        if let Ok(method) = HeaderValue::from_str(
+        let mut headers: Vec<(HeaderName, HeaderValue)> = Vec::with_capacity(req_headers.len()?);
+        let method = http::Method::from_str(
             request
                 .getattr(&self.constants.method)?
                 .cast::<PyString>()?
                 .to_str()?,
-        ) {
-            headers.push((HeaderName::from_static(":method"), method));
-        }
+        )
+        .map_err(|_| PyValueError::new_err("invalid HTTP method"))?;
 
         let request_url = request.getattr(&self.constants.url)?;
-        if let Ok(parsed_url) = url::Url::parse(request_url.cast::<PyString>()?.to_str()?) {
-            if let Ok(path_hdr) = HeaderValue::from_str(
-                &parsed_url[url::Position::BeforePath..url::Position::AfterQuery],
-            ) {
-                headers.push((HeaderName::from_static(":path"), path_hdr));
-            }
+        let url = url::Url::parse(request_url.cast::<PyString>()?.to_str()?)
+            .map_err(|_| PyValueError::new_err("invalid request URL"))?;
 
-            if let Ok(host_hdr) = HeaderValue::from_str(parsed_url.host_str().unwrap_or_default()) {
-                headers.push((HeaderName::from_static("host"), host_hdr));
-            }
-        }
-
-        for item in req_headers.getattr(&self.constants.items)?.try_iter()? {
+        for item in req_headers
+            .call_method0(&self.constants.items)?
+            .try_iter()?
+        {
             let item = item?;
             let name_py = item.get_item(0)?;
             let name_py_str = name_py.cast::<PyString>()?.to_str()?;
@@ -152,7 +182,7 @@ impl HTTPTransport {
             }
         }
 
-        let request_body = request.getattr(&self.constants.body)?;
+        let request_body = request.getattr(&self.constants.content)?;
         let body = if request_body.is_none() {
             RequestBody::Empty
         } else if let Ok(bytes) = request_body.extract::<PyBackedBytes>() {
@@ -166,6 +196,8 @@ impl HTTPTransport {
         if transport_bridge
             .bridge
             .send(TransportEvent::Start(StartStreamEvent {
+                method,
+                url,
                 headers,
                 body,
                 cluster_name: self.cluster_name.clone(),
@@ -181,7 +213,7 @@ impl HTTPTransport {
     }
 }
 
-#[pyclass(module = "_pyvoy.async.httpclient", frozen)]
+#[pyclass(module = "_pyvoy.asgi.httpclient", frozen)]
 pub(crate) struct StreamStartExecutor {
     headers: Vec<(HeaderName, HeaderValue)>,
     pub(crate) response_future: Py<PyAny>,
@@ -211,6 +243,10 @@ impl StreamStartExecutor {
 #[pymethods]
 impl StreamStartExecutor {
     fn __call__(&self, py: Python<'_>) -> PyResult<()> {
+        println!(
+            "Called StreamStartExecutor with headers: {:#?}, end_stream={}",
+            self.headers, self.end_stream
+        );
         let status = self
             .headers
             .iter()
@@ -247,7 +283,7 @@ impl StreamStartExecutor {
                 state.trailers = Some(trailers.clone().unbind());
             }
             kwargs.set_item(
-                &self.constants.body,
+                &self.constants.content,
                 self.response_content.clone().into_bound_py_any(py)?,
             )?;
             kwargs.set_item(&self.constants.trailers, trailers)?;
@@ -287,7 +323,7 @@ pub(crate) struct ResponseContentInner {
 /// Because Envoy does not support buffering responses from HTTP client calls, we need to
 /// eagerly create it when the request is started so the buffers are available as soon
 /// as any data comes in, even before Python reads it.
-#[pyclass(module = "_pyvoy.async.httpclient", frozen, skip_from_py_object)]
+#[pyclass(module = "_pyvoy.asgi.httpclient", frozen, skip_from_py_object)]
 #[derive(Clone)]
 pub(crate) struct ResponseContent {
     pub(crate) inner: Arc<ResponseContentInner>,
@@ -312,12 +348,20 @@ impl ResponseContent {
 
     /// Buffers response data to return to Python. Returns true if there is a pending Python future
     /// that needs to be notified via the event loop.
-    pub(super) fn feed_response_data(&self, data: &[EnvoyBuffer], end_stream: bool) -> bool {
+    pub(super) fn feed_response_data(&self, data: Vec<u8>, end_stream: bool) -> bool {
+        println!(
+            "Feeding response data, len={}, end_stream={}",
+            data.len(),
+            end_stream
+        );
         let mut state = self.inner.state.lock().unwrap();
-        for buffer in data {
-            state.body.extend_from_slice(buffer.as_slice());
-        }
+        state.body.extend_from_slice(&data);
         state.end_stream |= end_stream;
+        println!(
+            "Pending future: {}, body len={}",
+            state.pending_future.is_some(),
+            state.body.len()
+        );
         state.pending_future.is_some()
     }
 
@@ -349,11 +393,13 @@ impl ResponseContent {
     }
 
     fn __anext__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        println!("Called ResponseContent __anext__");
         let inner = &self.inner;
         let mut state = inner.state.lock_py_attached(py).unwrap();
         // There's really no use case for concurrently iterating an async body. Order can't be guaranteed,
         // anyways so we just return empty when there was already a pending future.
         if state.pending_future.is_some() {
+            println!("Already a pending future, returning empty");
             return ValueAwaitable::new_py(py, inner.constants.empty_bytes.bind(py));
         }
 
@@ -369,15 +415,19 @@ impl ResponseContent {
             }
         }
 
-        if state.end_stream {
-            return Err(PyStopAsyncIteration::new_err(()));
-        }
-
         if !state.body.is_empty() {
+            println!("Returning body chunk of len {}", state.body.len());
             let chunk = PyBytes::new(py, &state.body).into_any();
             state.body.clear();
             return ValueAwaitable::new_py(py, &chunk);
         }
+
+        if state.end_stream {
+            println!("End of stream reached, returning StopAsyncIteration");
+            return Err(PyStopAsyncIteration::new_err(()));
+        }
+
+        println!("Creating future for pending response data");
 
         let future = self
             .inner
@@ -392,6 +442,7 @@ impl ResponseContent {
 
     /// Called by the event loop when notifying of events from Envoy.
     fn __call__(&self, py: Python<'_>) -> PyResult<()> {
+        println!("Called ResponseContent __call__");
         let inner = &self.inner;
         let mut state = inner.state.lock_py_attached(py).unwrap();
         if state.body.is_empty() && !state.end_stream {

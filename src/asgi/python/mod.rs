@@ -35,6 +35,7 @@ struct ExecutorInner {
     app: Py<PyAny>,
     asgi: Py<PyDict>,
     extensions: Py<PyDict>,
+    root_path: Py<PyString>,
     loops: EventLoops,
     constants: Arc<Constants>,
     executor: Executor,
@@ -60,6 +61,7 @@ impl Executor {
     pub(crate) fn new(
         app_module: &str,
         app_attr: &str,
+        root_path: &str,
         constants: Arc<Constants>,
         worker_threads: usize,
         enable_lifespan: Option<bool>,
@@ -72,10 +74,11 @@ impl Executor {
             enable_lifespan,
         )?;
 
-        let extensions = Python::attach(|py| {
+        let (extensions, root_path) = Python::attach(|py| {
             let extensions = PyDict::new(py);
             extensions.set_item("http.response.trailers", PyDict::new(py))?;
-            Ok::<_, PyErr>(extensions.unbind())
+            let root_path = PyString::new(py, root_path);
+            Ok::<_, PyErr>((extensions.unbind(), root_path.unbind()))
         })?;
 
         let (tx, rx) = mpsc::channel::<Event>();
@@ -88,6 +91,7 @@ impl Executor {
             app,
             asgi,
             extensions,
+            root_path,
             loops: loops.clone(),
             constants,
             executor: executor.clone(),
@@ -226,6 +230,7 @@ impl ExecutorInner {
                     app: self.app.clone_ref(py),
                     asgi: self.asgi.clone_ref(py),
                     extensions: self.extensions.clone_ref(py),
+                    root_path: self.root_path.clone_ref(py),
                     event: Some(event),
                     constants: self.constants.clone(),
                     executor: self.executor.clone(),
@@ -348,6 +353,7 @@ struct AppExecutor {
     app: Py<PyAny>,
     asgi: Py<PyDict>,
     extensions: Py<PyDict>,
+    root_path: Py<PyString>,
     event: Option<ExecuteAppEvent>,
     constants: Arc<Constants>,
     executor: Executor,
@@ -375,6 +381,7 @@ impl AppExecutor {
             &self.constants.http,
             &self.asgi,
             &self.extensions,
+            Some(&self.root_path),
             &self.state,
             &self.constants,
         )?;

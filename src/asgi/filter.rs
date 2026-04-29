@@ -9,7 +9,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use crate::asgi::python;
 use crate::asgi::python::*;
 use crate::asgi::shared::ExecutorHandles;
-use crate::asgi::transport::{RequestBody, ResponseState, TransportEvent};
+use crate::asgi::transport::{
+    OnHttpStreamDataEvent, OnHttpStreamheadersEvent, RequestBody, ResponseState, TransportEvent,
+};
 use crate::envoy::*;
 use crate::eventbridge::EventBridge;
 use crate::types::*;
@@ -22,25 +24,32 @@ pub struct Config {
 impl Config {
     pub fn new(
         app: &str,
+        root_path: &str,
         constants: Arc<Constants>,
         worker_threads: usize,
         enable_lifespan: Option<bool>,
     ) -> Option<Self> {
         let (module, attr) = app.split_once(":").unwrap_or((app, "app"));
-        let (executor, handles) =
-            match python::Executor::new(module, attr, constants, worker_threads, enable_lifespan) {
-                Ok(executor) => executor,
-                Err(e) => {
-                    Python::attach(|py| {
-                        let tb = e
-                            .traceback(py)
-                            .and_then(|tb| tb.format().ok())
-                            .unwrap_or_default();
-                        envoy_log_error!("Failed to initialize ASGI app\n{}{}", tb, e);
-                    });
-                    return None;
-                }
-            };
+        let (executor, handles) = match python::Executor::new(
+            module,
+            attr,
+            root_path,
+            constants,
+            worker_threads,
+            enable_lifespan,
+        ) {
+            Ok(executor) => executor,
+            Err(e) => {
+                Python::attach(|py| {
+                    let tb = e
+                        .traceback(py)
+                        .and_then(|tb| tb.format().ok())
+                        .unwrap_or_default();
+                    envoy_log_error!("Failed to initialize ASGI app\n{}{}", tb, e);
+                });
+                return None;
+            }
+        };
         Some(Self {
             executor,
             handles: Some(handles),
@@ -178,20 +187,12 @@ impl<EHF: EnvoyHttpFilter> HttpFilter<EHF> for Filter {
 
     fn on_http_stream_headers(
         &mut self,
-        _envoy_filter: &mut EHF,
+        envoy_filter: &mut EHF,
         stream_handle: u64,
         response_headers: &[(EnvoyBuffer, EnvoyBuffer)],
         end_stream: bool,
     ) {
-        let Some(state) = self.transport_responses.get_mut(&stream_handle) else {
-            // Can't happen in practice but avoid panic anyways.
-            return;
-        };
-        let Some(future) = state.future.take() else {
-            // Shouldn't happen in practice.
-            return;
-        };
-
+        println!("Received headers for transport stream {stream_handle}, end_stream={end_stream}");
         let mut headers: Vec<(HeaderName, HeaderValue)> =
             Vec::with_capacity(response_headers.len());
         for (k, v) in response_headers {
@@ -204,26 +205,50 @@ impl<EHF: EnvoyHttpFilter> HttpFilter<EHF> for Filter {
                 _ => continue,
             }
         }
-        self.executor.handle_transport_stream_started(
-            headers,
-            state.content.clone(),
-            future,
-            end_stream,
-        );
+        if self
+            .transport_bridge
+            .send(TransportEvent::OnHttpStreamHeaders(
+                OnHttpStreamheadersEvent {
+                    stream_handle,
+                    headers,
+                    end_stream,
+                },
+            ))
+            .is_ok()
+        {
+            envoy_filter
+                .new_scheduler()
+                .commit(EVENT_ID_OUTGOING_REQUEST);
+        }
     }
 
     fn on_http_stream_data(
         &mut self,
-        _envoy_filter: &mut EHF,
+        envoy_filter: &mut EHF,
         stream_handle: u64,
         response_data: &[EnvoyBuffer],
         end_stream: bool,
     ) {
-        let Some(state) = self.transport_responses.get_mut(&stream_handle) else {
-            return;
-        };
-        if state.content.feed_response_data(response_data, end_stream) {
-            self.executor.notify_response(state.content.clone());
+        let len = response_data.iter().map(|b| b.as_slice().len()).sum();
+        println!(
+            "Received data for transport stream {stream_handle}, len={len}, end_stream={end_stream}"
+        );
+        let mut body = Vec::with_capacity(len);
+        for buffer in response_data {
+            body.extend_from_slice(buffer.as_slice());
+        }
+        if self
+            .transport_bridge
+            .send(TransportEvent::OnHttpStreamData(OnHttpStreamDataEvent {
+                stream_handle,
+                data: body,
+                end_stream,
+            }))
+            .is_ok()
+        {
+            envoy_filter
+                .new_scheduler()
+                .commit(EVENT_ID_OUTGOING_REQUEST);
         }
     }
 
@@ -249,9 +274,7 @@ impl<EHF: EnvoyHttpFilter> HttpFilter<EHF> for Filter {
     ) {
     }
 
-    fn on_http_stream_complete(&mut self, _envoy_filter: &mut EHF, stream_handle: u64) {
-        self.transport_responses.remove(&stream_handle);
-    }
+    fn on_http_stream_complete(&mut self, _envoy_filter: &mut EHF, stream_handle: u64) {}
 }
 
 impl Filter {
@@ -336,10 +359,18 @@ impl Filter {
     fn process_transport_events(&mut self, envoy_filter: &mut impl EnvoyHttpFilter) {
         self.transport_bridge.process(|event| match event {
             TransportEvent::Start(event) => {
-                let mut headers: Vec<(&str, &[u8])> = Vec::with_capacity(event.headers.len() + 1);
+                let mut headers: Vec<(&str, &[u8])> = Vec::with_capacity(event.headers.len() + 4);
                 for (k, v) in event.headers.iter() {
                     headers.push((k.as_str(), v.as_bytes()));
                 }
+                headers.push((":method", event.method.as_str().as_bytes()));
+                headers.push((
+                    ":path",
+                    event.url[url::Position::BeforePath..url::Position::AfterQuery].as_bytes(),
+                ));
+                headers.push((":scheme", event.url.scheme().as_bytes()));
+                headers.push((":authority", event.url[url::Position::BeforeHost..url::Position::AfterPort].as_bytes(),));
+                println!("authority: {}", &event.url[url::Position::BeforeHost..url::Position::AfterPort]);
                 match event.body {
                     RequestBody::Empty | RequestBody::Buffered(_) => {
                         todo!()
@@ -348,14 +379,21 @@ impl Filter {
                         let cluster_name = if let Some(name) = event.cluster_name.as_ref() {
                             name.as_str()
                         } else {
-                            "__pyvoy_default_upstream__"
+                            match event.url.scheme() {
+                                "https" => "__pyvoy_default_upstream_https__",
+                                _ => "__pyvoy_default_upstream_http__",
+                            }
                         };
+                        println!("Starting transport stream to cluster {cluster_name}");
                         let (_res, stream_id) = envoy_filter.start_http_stream(
                             cluster_name,
                             headers,
                             None,
                             true,
                             60_000,
+                        );
+                        println!(
+                            "Started transport stream to cluster {cluster_name} with stream: {stream_id}"
                         );
                         self.transport_responses.insert(
                             stream_id,
@@ -365,6 +403,37 @@ impl Filter {
                             },
                         );
                     }
+                }
+            }
+            TransportEvent::OnHttpStreamHeaders(event) => {
+                let OnHttpStreamheadersEvent{ stream_handle, headers, end_stream } = event;
+                let Some(state) = self.transport_responses.get_mut(&stream_handle) else {
+                    println!("No state found for transport stream {stream_handle}");
+                    // Can't happen in practice but avoid panic anyways.
+                    return;
+                };
+                let Some(future) = state.future.take() else {
+                    println!("No future found for transport stream {stream_handle}");
+                    // Shouldn't happen in practice.
+                    return;
+                };
+                self.executor.handle_transport_stream_started(
+                    headers,
+                    state.content.clone(),
+                    future,
+                    end_stream,
+                );
+            }
+            TransportEvent::OnHttpStreamData(event) => {
+                let OnHttpStreamDataEvent{ stream_handle, data, end_stream } = event;
+                let Some(state) = self.transport_responses.get_mut(&stream_handle) else {
+                    println!("No state found for transport stream {stream_handle}");
+                    // Can't happen in practice but avoid panic anyways.
+                    return;
+                };
+                if state.content.feed_response_data(data, end_stream) {
+                    println!("Notifying response future for transport stream {stream_handle}");
+                    self.executor.notify_response(state.content.clone());
                 }
             }
         });

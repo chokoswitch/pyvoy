@@ -90,6 +90,7 @@ class PyvoyServer:
     _worker_threads: int | None
     _lifespan: bool | None
     _additional_envoy_args: list[str] | None
+    _env: dict[str, str]
 
     _admin_address: str | None
 
@@ -112,6 +113,7 @@ class PyvoyServer:
         lifespan: bool | None = None,
         websockets: bool = False,
         additional_envoy_args: list[str] | None = None,
+        env: dict[str, str] | None = None,
         stdout: int | IO[bytes] | None = subprocess.DEVNULL,
         stderr: int | IO[bytes] | None = subprocess.DEVNULL,
     ) -> None:
@@ -159,6 +161,7 @@ class PyvoyServer:
         self._worker_threads = worker_threads
         self._lifespan = lifespan
         self._additional_envoy_args = additional_envoy_args
+        self._env = env if env is not None else {}
 
         self._process = None
         self._listener_port_tls = None
@@ -185,7 +188,7 @@ class PyvoyServer:
         """
         config = self.get_envoy_config()
 
-        env = {**os.environ, **get_envoy_environ()}
+        env = {**os.environ, **get_envoy_environ(), **self._env}
 
         with NamedTemporaryFile("r") as admin_address_file:
             if sys.platform == "win32":
@@ -583,7 +586,10 @@ class PyvoyServer:
                     "name": "envoy.clusters.dynamic_forward_proxy",
                     "typed_config": {
                         "@type": "type.googleapis.com/envoy.extensions.clusters.dynamic_forward_proxy.v3.ClusterConfig",
-                        "sub_clusters_config": {"lb_policy": "ROUND_ROBIN"},
+                        "dns_cache_config": {
+                            "name": "__pyvoy_default_upstream_http_cache__",
+                            "dns_lookup_family": "V4_ONLY",
+                        },
                     },
                 },
             },
@@ -594,7 +600,10 @@ class PyvoyServer:
                     "name": "envoy.clusters.dynamic_forward_proxy",
                     "typed_config": {
                         "@type": "type.googleapis.com/envoy.extensions.clusters.dynamic_forward_proxy.v3.ClusterConfig",
-                        "sub_clusters_config": {"lb_policy": "ROUND_ROBIN"},
+                        "dns_cache_config": {
+                            "name": "__pyvoy_default_upstream_https_cache__",
+                            "dns_lookup_family": "V4_ONLY",
+                        },
                     },
                 },
             },

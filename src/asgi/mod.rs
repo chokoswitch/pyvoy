@@ -8,3 +8,7 @@ mod shared;
 mod transport;
 /// The ASGI websocket filter.
 pub(crate) mod websocket;
+
+pub(crate) fn register_py_modules(py: pyo3::Python<'_>) -> pyo3::PyResult<()> {
+    transport::register_py_module(py)
+}
