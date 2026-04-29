@@ -8,7 +8,7 @@ use envoy_proxy_dynamic_modules_rust_sdk::{EnvoyBuffer, EnvoyHttpFilterScheduler
 use http::{HeaderName, HeaderValue, StatusCode};
 use pyo3::{
     Bound, IntoPyObjectExt, Py, PyAny, PyResult, Python,
-    exceptions::PyStopAsyncIteration,
+    exceptions::{PyRuntimeError, PyStopAsyncIteration},
     pybacked::PyBackedBytes,
     pyclass, pymethods,
     sync::MutexExt,
@@ -57,26 +57,62 @@ pub(super) enum TransportEvent {
     Start(StartStreamEvent),
 }
 
-#[pyclass(module = "_pyvoy.async.httpclient")]
-struct HTTPTransport {
-    cluster_name: Option<Arc<String>>,
+#[pyclass(module = "_pyvoy.async.httpclient", frozen)]
+pub(crate) struct TransportBridge {
     loop_: Py<PyAny>,
     bridge: EventBridge<TransportEvent>,
     scheduler: Arc<Box<dyn EnvoyHttpFilterScheduler>>,
+}
+
+impl TransportBridge {
+    pub(crate) fn new(
+        loop_: Py<PyAny>,
+        bridge: EventBridge<TransportEvent>,
+        scheduler: Arc<Box<dyn EnvoyHttpFilterScheduler>>,
+    ) -> Self {
+        Self {
+            loop_,
+            bridge,
+            scheduler,
+        }
+    }
+}
+
+#[pyclass(module = "_pyvoy.async.httpclient")]
+struct HTTPTransport {
+    cluster_name: Option<Arc<String>>,
     constants: Arc<Constants>,
 }
 
 #[pymethods]
 impl HTTPTransport {
+    #[new]
+    #[pyo3(signature = (*, cluster_name=None))]
+    fn py_new(py: Python<'_>, cluster_name: Option<String>) -> Self {
+        Self {
+            cluster_name: cluster_name.map(Arc::new),
+            constants: Constants::get(py, ""),
+        }
+    }
+
     fn execute<'py>(
         &self,
         py: Python<'py>,
         request: &Bound<'py, PyAny>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let future = self
-            .loop_
+        let transport_bridge = self
+            .constants
+            .transport_bridge_contextvar_get
             .bind(py)
-            .call_method0(&self.constants.create_future)?;
+            .call1((py.None(),))?;
+        if transport_bridge.is_none() {
+            return Err(PyRuntimeError::new_err(
+                "TransportBridge not found in contextvars. This likely means the HTTP client was used outside of the context of the request.",
+            ));
+        }
+        let transport_bridge = transport_bridge.cast::<TransportBridge>()?.get();
+        let loop_ = transport_bridge.loop_.bind(py);
+        let future = loop_.call_method0(&self.constants.create_future)?;
 
         let req_headers = request.getattr(&self.constants.headers)?;
 
@@ -127,10 +163,9 @@ impl HTTPTransport {
             RequestBody::Iter(request_body.unbind())
         };
 
-        let response_content =
-            ResponseContent::new(self.loop_.clone_ref(py), self.constants.clone());
+        let response_content = ResponseContent::new(loop_.clone().unbind(), self.constants.clone());
 
-        if self
+        if transport_bridge
             .bridge
             .send(TransportEvent::Start(StartStreamEvent {
                 headers,
@@ -141,7 +176,7 @@ impl HTTPTransport {
             }))
             .is_ok()
         {
-            self.scheduler.commit(EVENT_ID_OUTGOING_REQUEST);
+            transport_bridge.scheduler.commit(EVENT_ID_OUTGOING_REQUEST);
         }
 
         Ok(future)

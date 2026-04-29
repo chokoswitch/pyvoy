@@ -14,7 +14,7 @@ use crate::{
             headers::extract_headers_from_event,
             scope::new_scope_dict,
         },
-        transport::{ResponseContent, StreamStartExecutor},
+        transport::{ResponseContent, StreamStartExecutor, TransportBridge, TransportEvent},
     },
     eventbridge::EventBridge,
     types::{ClientDisconnectedError, Constants, Scope, SyncReceiver},
@@ -23,6 +23,7 @@ use envoy_proxy_dynamic_modules_rust_sdk::EnvoyHttpFilterScheduler;
 use http::{HeaderName, HeaderValue, StatusCode};
 use pyo3::{
     IntoPyObjectExt,
+    call::PyCallArgs,
     exceptions::{PyRuntimeError, PyValueError},
     prelude::*,
     types::{PyBytes, PyDict, PyNone, PyString},
@@ -137,6 +138,7 @@ impl Executor {
         response_closed: Arc<AtomicBool>,
         recv_bridge: EventBridge<RecvFuture>,
         send_bridge: EventBridge<SendEvent>,
+        transport_bridge: EventBridge<TransportEvent>,
         scheduler: Box<dyn EnvoyHttpFilterScheduler>,
     ) {
         self.tx
@@ -147,6 +149,7 @@ impl Executor {
                 response_closed,
                 recv_bridge,
                 send_bridge,
+                transport_bridge,
                 scheduler,
             }))
             .unwrap();
@@ -360,6 +363,7 @@ impl AppExecutor {
             response_closed,
             recv_bridge,
             send_bridge,
+            transport_bridge,
             scheduler,
         } = self.event.take().unwrap();
 
@@ -409,7 +413,25 @@ impl AppExecutor {
                 constants: self.constants.clone(),
             },
         ))?;
-        let future = loop_.call_method1(&self.constants.create_task, (coro,))?;
+
+        let transport_bridge =
+            TransportBridge::new(loop_.clone().unbind(), transport_bridge, scheduler.clone())
+                .into_py_any(py)?;
+        let token = self
+            .constants
+            .transport_bridge_contextvar_set
+            .call1(py, (transport_bridge,))?;
+
+        let future = {
+            let _reset = RunOnDrop(
+                self.constants
+                    .transport_bridge_contextvar_reset
+                    .bind(py)
+                    .clone(),
+                Some((token,)),
+            );
+            loop_.call_method1(&self.constants.create_task, (coro,))?
+        };
         future.call_method1(
             &self.constants.add_done_callback,
             (AppFutureHandler {
@@ -469,6 +491,7 @@ struct ExecuteAppEvent {
     response_closed: Arc<AtomicBool>,
     recv_bridge: EventBridge<RecvFuture>,
     send_bridge: EventBridge<SendEvent>,
+    transport_bridge: EventBridge<TransportEvent>,
     scheduler: Box<dyn EnvoyHttpFilterScheduler>,
 }
 
@@ -828,6 +851,23 @@ impl Drop for SendFuture {
     fn drop(&mut self) {
         if let Some(future) = self.future.take() {
             self.executor.handle_dropped_send_future(future);
+        }
+    }
+}
+
+struct RunOnDrop<'py, A>(Bound<'py, PyAny>, Option<A>)
+where
+    A: PyCallArgs<'py>;
+
+impl<'py, A> Drop for RunOnDrop<'py, A>
+where
+    A: PyCallArgs<'py>,
+{
+    fn drop(&mut self) {
+        if let Some(args) = self.1.take() {
+            let _ = self.0.call1(args);
+        } else {
+            let _ = self.0.call0();
         }
     }
 }

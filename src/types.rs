@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use std::sync::mpsc::Receiver;
 
 use crate::envoy::*;
@@ -8,6 +9,7 @@ use http::{
     HeaderName, HeaderValue, Method,
     uri::{self, Scheme},
 };
+use pyo3::sync::PyOnceLock;
 use pyo3::{
     IntoPyObjectExt, create_exception,
     exceptions::PyOSError,
@@ -242,6 +244,13 @@ pub(crate) struct Constants {
     /// The class pyqwest.Response.
     pub class_pyqwest_response: Py<PyAny>,
 
+    /// The function get on the ContextVar used for transport bridging.
+    pub transport_bridge_contextvar_get: Py<PyAny>,
+    /// The function set on the ContextVar used for transport bridging.
+    pub transport_bridge_contextvar_set: Py<PyAny>,
+    /// The function reset on the ContextVar used for transport bridging.
+    pub transport_bridge_contextvar_reset: Py<PyAny>,
+
     /// A singleton ClientDisconnectedError exception instance.
     /// The traceback is not important since it is caused by the client,
     /// so we can share it.
@@ -249,29 +258,34 @@ pub(crate) struct Constants {
 }
 
 impl Constants {
-    pub fn new(py: Python<'_>, root_path: &str) -> Self {
-        let client_disconnected_err = ClientDisconnectedError::new_err(())
-            .into_py_any(py)
-            .unwrap();
-        client_disconnected_err
-            .setattr(py, "__traceback__", PyNone::get(py))
-            .unwrap();
+    pub fn get(py: Python<'_>, root_path: &str) -> Arc<Self> {
+        static INSTANCE: PyOnceLock<Arc<Constants>> = PyOnceLock::new();
+        // It is a programming bug for this to fail so we just unwrap.
+        INSTANCE
+            .get_or_init(py, || Arc::new(Self::create(py, root_path).unwrap()))
+            .clone()
+    }
+
+    fn create(py: Python<'_>, root_path: &str) -> PyResult<Self> {
+        let client_disconnected_err = ClientDisconnectedError::new_err(()).into_py_any(py)?;
+        client_disconnected_err.setattr(py, "__traceback__", PyNone::get(py))?;
 
         let asgi_empty_recv = PyDict::new(py);
-        asgi_empty_recv.set_item("type", "http.request").unwrap();
-        asgi_empty_recv
-            .set_item("body", PyBytes::new(py, b""))
-            .unwrap();
-        asgi_empty_recv.set_item("more_body", false).unwrap();
+        asgi_empty_recv.set_item("type", "http.request")?;
+        asgi_empty_recv.set_item("body", PyBytes::new(py, b""))?;
+        asgi_empty_recv.set_item("more_body", false)?;
 
         let asgi_empty_recv_disconnect = PyDict::new(py);
-        asgi_empty_recv_disconnect
-            .set_item("type", "http.disconnect")
-            .unwrap();
+        asgi_empty_recv_disconnect.set_item("type", "http.disconnect")?;
 
-        let mod_pyqwest = py.import("pyqwest").unwrap();
+        let mod_pyqwest = py.import("pyqwest")?;
 
-        Self {
+        let mod_contextvars = py.import("contextvars")?;
+        let transport_bridge_contextvar = mod_contextvars
+            .getattr("ContextVar")?
+            .call1(("pyvoy.asgi.transport_bridge",))?;
+
+        Ok(Self {
             asgi: PyString::new(py, "asgi").unbind(),
             extensions: PyString::new(py, "extensions").unbind(),
             http: PyString::new(py, "http").unbind(),
@@ -384,11 +398,17 @@ impl Constants {
             add: PyString::new(py, "add").unbind(),
             items: PyString::new(py, "items").unbind(),
             url: PyString::new(py, "url").unbind(),
-            class_pyqwest_headers: mod_pyqwest.getattr("Headers").unwrap().unbind(),
-            class_pyqwest_response: mod_pyqwest.getattr("Response").unwrap().unbind(),
+            class_pyqwest_headers: mod_pyqwest.getattr("Headers")?.unbind(),
+            class_pyqwest_response: mod_pyqwest.getattr("Response")?.unbind(),
+
+            transport_bridge_contextvar_get: transport_bridge_contextvar.getattr("get")?.unbind(),
+            transport_bridge_contextvar_set: transport_bridge_contextvar.getattr("set")?.unbind(),
+            transport_bridge_contextvar_reset: transport_bridge_contextvar
+                .getattr("reset")?
+                .unbind(),
 
             client_disconnected_err,
-        }
+        })
     }
 }
 

@@ -111,6 +111,7 @@ impl<EHF: EnvoyHttpFilter> HttpFilter<EHF> for Filter {
             self.response_closed.clone(),
             self.recv_bridge.clone(),
             self.send_bridge.clone(),
+            self.transport_bridge.clone(),
             Box::from(envoy_filter.new_scheduler()),
         );
         abi::envoy_dynamic_module_type_on_http_filter_request_headers_status::StopIteration
